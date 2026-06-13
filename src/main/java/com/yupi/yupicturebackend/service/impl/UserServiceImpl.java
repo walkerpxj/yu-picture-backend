@@ -4,6 +4,7 @@ import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.ObjUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.crypto.digest.BCrypt;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.yupi.yupicturebackend.exception.BusinessException;
@@ -18,10 +19,13 @@ import com.yupi.yupicturebackend.model.vo.UserVO;
 import com.yupi.yupicturebackend.service.UserService;
 import com.yupi.yupicturebackend.mapper.UserMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
 
+import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.util.concurrent.TimeUnit;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -37,6 +41,24 @@ import static com.yupi.yupicturebackend.constant.UserConstant.USER_LOGIN_STATE;
 @Service
 @Slf4j
 public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements UserService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 登录失败计数的 Redis key 前缀
+     */
+    private static final String LOGIN_FAIL_KEY_PREFIX = "login:fail:";
+
+    /**
+     * 允许的最大连续登录失败次数，超过则锁定
+     */
+    private static final int MAX_LOGIN_FAIL_COUNT = 10;
+
+    /**
+     * 锁定时长（秒）
+     */
+    private static final long LOGIN_LOCK_SECONDS = 30;
 
     /**
      * 用户注册
@@ -94,32 +116,46 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         if (userLoginRequest.getUserPassword().length() < 8) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "用户密码错误");
         }
-        //2。对用户传输的密码进行加密
-        String encryptPassword = getEncryptPassword(userLoginRequest.getUserPassword());
-        //3.查询数据库中的用户是否存在
+        //1.5 登录失败限流：若该账号连续失败次数已达上限，直接拒绝
+        String failKey = LOGIN_FAIL_KEY_PREFIX + userLoginRequest.getUserAccount();
+        String failCountStr = stringRedisTemplate.opsForValue().get(failKey);
+        if (failCountStr != null && Integer.parseInt(failCountStr) >= MAX_LOGIN_FAIL_COUNT) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "登录失败次数过多，请稍后再试");
+        }
+        //2.根据账号查询用户（BCrypt 每次输出不同，不能再用密文作为查询条件）
         User user = lambdaQuery().eq(User::getUserAccount, userLoginRequest.getUserAccount())
-                .eq(User::getUserPassword, encryptPassword)
                 .one();
-        //不存在，抛异常
-        if (user == null) {
+        //3.校验密码（兼容 BCrypt 新格式与 MD5 旧格式）
+        if (user == null || !matchesPassword(userLoginRequest.getUserPassword(), user.getUserPassword())) {
+            //登录失败：累加失败计数并刷新锁定时间窗口
+            recordLoginFail(failKey);
             log.info("user login failed,userAccount cannot match userPassword");
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "用户不存在或者密码错误");
         }
-        //4。保存用户的登录态
-        request.getSession().setAttribute(USER_LOGIN_STATE, user);
+        //登录成功：清除失败计数
+        stringRedisTemplate.delete(failKey);
+        //3.5 平滑迁移：若库中仍是旧版 MD5，登录成功后自动升级为 BCrypt
+        if (!user.getUserPassword().startsWith("$2")) {
+            User upgrade = new User();
+            upgrade.setId(user.getId());
+            upgrade.setUserPassword(getEncryptPassword(userLoginRequest.getUserPassword()));
+            this.updateById(upgrade);
+        }
+        //4。保存用户的登录态（只存 userId，避免把密码哈希等敏感信息写入 Session/Redis）
+        request.getSession().setAttribute(USER_LOGIN_STATE, user.getId());
         return this.getLoginUserVO(user);
     }
 
     @Override
     public User getLoginUser(HttpServletRequest request) {
-        //判断是否登录
-        Object userObj = request.getSession().getAttribute(USER_LOGIN_STATE);
-        User currentUser = (User) userObj;
-        if (currentUser == null || currentUser.getId() == null) {
+        //判断是否登录（Session 中只存了 userId）
+        Object userIdObj = request.getSession().getAttribute(USER_LOGIN_STATE);
+        if (userIdObj == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
         }
-        //从数据库中查询（追求性能的话可以注释，直接返回上述结果）
-        currentUser = this.getById(currentUser.getId());
+        Long userId = (Long) userIdObj;
+        //从数据库中查询最新的用户信息
+        User currentUser = this.getById(userId);
         if (currentUser == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
         }
@@ -128,14 +164,55 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
     /**
      * 获取加密后的密码
+     * <p>
+     * 使用 BCrypt 算法，每次加密都会自动生成随机盐，
+     * 因此同一明文多次调用的返回值不同，验证时需用 {@link BCrypt#checkpw} 比对。
      *
      * @param userPassword 用户密码
-     * @return 加密后的密码
+     * @return 加密后的密码（形如 $2a$10$...）
      */
     @Override
     public String getEncryptPassword(String userPassword) {
+        return BCrypt.hashpw(userPassword);
+    }
+
+    /**
+     * 旧版 MD5 加密（仅用于兼容存量密码的平滑迁移，请勿用于新密码）
+     */
+    private String getLegacyMd5Password(String userPassword) {
         final String SALT = "yingdaomayi";
         return DigestUtils.md5DigestAsHex((SALT + userPassword).getBytes());
+    }
+
+    /**
+     * 校验原始密码与数据库存储的密码是否匹配。
+     * 兼容两种格式：BCrypt（新）与 MD5（旧）。
+     *
+     * @return 是否匹配
+     */
+    private boolean matchesPassword(String rawPassword, String storedPassword) {
+        if (StrUtil.isBlank(storedPassword)) {
+            return false;
+        }
+        // BCrypt 哈希以 $2a$ / $2b$ / $2y$ 开头
+        if (storedPassword.startsWith("$2")) {
+            return BCrypt.checkpw(rawPassword, storedPassword);
+        }
+        // 否则按旧版 MD5 比对
+        return getLegacyMd5Password(rawPassword).equals(storedPassword);
+    }
+
+    /**
+     * 记录一次登录失败：失败计数 +1，并重置锁定时间窗口。
+     * 首次失败时设置过期时间，使每次失败都把锁定窗口顺延 {@link #LOGIN_LOCK_SECONDS} 秒。
+     *
+     * @param failKey 该账号对应的 Redis 计数 key
+     */
+    private void recordLoginFail(String failKey) {
+        Long count = stringRedisTemplate.opsForValue().increment(failKey);
+        // 每次失败都刷新过期时间，避免计数永久残留
+        stringRedisTemplate.expire(failKey, LOGIN_LOCK_SECONDS, TimeUnit.SECONDS);
+        log.info("login fail count for key={} is {}", failKey, count);
     }
 
     /**
