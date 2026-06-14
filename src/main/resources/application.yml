@@ -9,12 +9,12 @@ server:
 spring:
   application:
     name: yu-picture-backend
-  #数据库配置
+  #激活的环境配置（敏感配置放在不提交 git 的 application-local.yml 中）
+  profiles:
+    active: local
+  #数据库配置（url/username/password 等敏感信息放在 application-local.yml）
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://localhost:3306/yu_picture
-    username: root
-    password: 123456
   #redis配置
 #  redis:
 #   database: 0

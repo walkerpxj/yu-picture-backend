@@ -30,15 +30,14 @@ public class UserController {
     private final UserService userService;
 
     /**
-     * 健康检查
+     * 用户注册（开放注册，访客可自助注册为普通用户）
      *
      * @return
      */
     @PostMapping("/register")
-    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
     public BaseResponse<Long> userRegister(@RequestBody UserRegisterRequest userRegisterRequest) {
         ThrowUtils.throwIf(userRegisterRequest == null, ErrorCode.PARAMS_ERROR);
-        long result = userService.uerRegister(userRegisterRequest);
+        long result = userService.userRegister(userRegisterRequest);
         return ResultUtils.success(result);
     }
 

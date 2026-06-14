@@ -19,6 +19,7 @@ import com.yupi.yupicturebackend.model.vo.UserVO;
 import com.yupi.yupicturebackend.service.UserService;
 import com.yupi.yupicturebackend.mapper.UserMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.DigestUtils;
@@ -67,7 +68,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
      * @return
      */
     @Override
-    public long uerRegister(UserRegisterRequest userRegisterRequest) {
+    public long userRegister(UserRegisterRequest userRegisterRequest) {
         //1.校验参数
         if (userRegisterRequest.getUserPassword() == null || userRegisterRequest.getUserAccount() == null ||
                 userRegisterRequest.getCheckPassword() == null) {
@@ -95,9 +96,15 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         User user = new User();
         user.setUserAccount(userRegisterRequest.getUserAccount());
         user.setUserPassword(encryptPassword);
-        user.setUserName("樱岛麻衣的狗");
+        user.setUserName(userRegisterRequest.getUserAccount());
         user.setUserRole(UserRoleEnum.USER.getValue());
-        boolean saveResult = this.save(user);
+        boolean saveResult;
+        try {
+            saveResult = this.save(user);
+        } catch (DuplicateKeyException e) {
+            // 兜底并发场景：两个请求同时通过了上面的 count 校验，靠数据库唯一索引 uk_userAccount 拦截
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "账号重复，请重新输入！");
+        }
         if (!saveResult) {
             throw new BusinessException(ErrorCode.SYSTEM_ERROR, "注册失败，数据库错误!");
         }
