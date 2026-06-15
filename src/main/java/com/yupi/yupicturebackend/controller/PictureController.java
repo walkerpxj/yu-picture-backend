@@ -198,8 +198,10 @@ public class PictureController {
             // 普通用户默认只能看到审核通过的数据
             pictureQueryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
             pictureQueryRequest.setNullSpaceId(true);
-        }else {
-            // 私有空间
+            // 公开图库读多写少、所有人看到的内容一致，使用 Redis 缓存
+            return ResultUtils.success(getPublicPictureVOPage(pictureQueryRequest, request));
+        } else {
+            // 私有/团队空间：因人而异且需鉴权，不走缓存
             User loginUser = userService.getLoginUser(request);
             Space space = spaceService.getById(spaceId);
             ThrowUtils.throwIf(space == null, ErrorCode.NOT_FOUND_ERROR, "空间不存在");
@@ -210,12 +212,37 @@ public class PictureController {
             if (!hasPermission) {
                 throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "没有空间权限");
             }
+            Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
+                    pictureService.getQueryWrapper(pictureQueryRequest));
+            return ResultUtils.success(pictureService.getPictureVOPage(picturePage, request));
         }
-        // 查询数据库
+    }
+
+    /**
+     * 查询公开图库分页（带 Redis 缓存）。
+     * 缓存 key 由查询条件哈希得到；过期时间加随机量，避免缓存雪崩。
+     */
+    private Page<PictureVO> getPublicPictureVOPage(PictureQueryRequest pictureQueryRequest, HttpServletRequest request) {
+        long current = pictureQueryRequest.getCurrent();
+        long size = pictureQueryRequest.getPageSize();
+        // 构建缓存 key
+        String queryCondition = JSONUtil.toJsonStr(pictureQueryRequest);
+        String hashKey = DigestUtils.md5DigestAsHex(queryCondition.getBytes());
+        String cacheKey = String.format("yupicture:listPictureVOByPage:%s", hashKey);
+        ValueOperations<String, String> opsForValue = stringRedisTemplate.opsForValue();
+        // 1. 查缓存
+        String cachedValue = opsForValue.get(cacheKey);
+        if (cachedValue != null) {
+            return JSONUtil.toBean(cachedValue, Page.class);
+        }
+        // 2. 未命中，查数据库
         Page<Picture> picturePage = pictureService.page(new Page<>(current, size),
                 pictureService.getQueryWrapper(pictureQueryRequest));
-        // 获取封装类
-        return ResultUtils.success(pictureService.getPictureVOPage(picturePage, request));
+        Page<PictureVO> pictureVOPage = pictureService.getPictureVOPage(picturePage, request);
+        // 3. 写缓存，过期 5 - 10 分钟（加随机量防雪崩）
+        int cacheExpireTime = 300 + RandomUtil.randomInt(0, 300);
+        opsForValue.set(cacheKey, JSONUtil.toJsonStr(pictureVOPage), cacheExpireTime, TimeUnit.SECONDS);
+        return pictureVOPage;
     }
 
 

@@ -40,6 +40,7 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
+import org.springframework.aop.framework.AopContext;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Async;
@@ -153,12 +154,8 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture> impl
         // 构造要入库的图片信息
         Picture picture = new Picture();
         picture.setUrl(uploadPictureResult.getUrl());
-        String picName = uploadPictureResult.getPicName();
         picture.setThumbnailUrl(uploadPictureResult.getThumbnailUrl());
-        if (pictureUploadRequest != null && StrUtil.isNotBlank(uploadPictureResult.getPicName())) {
-            picName = uploadPictureResult.getPicName();
-        }
-        picture.setName(picName);
+        picture.setName(uploadPictureResult.getPicName());
         picture.setSpaceId(spaceId);
         picture.setPicSize(uploadPictureResult.getPicSize());
         picture.setPicWidth(uploadPictureResult.getPicWidth());
@@ -174,7 +171,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture> impl
         }
         Long finalSpaceId = spaceId;
         transactionTemplate.execute(status -> {
-            // 鎻掑叆鏁版嵁
+            // 插入数据
             boolean result = this.saveOrUpdate(picture);
             ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "图片上传失败，数据库操作失败");
             // 更新空间的使用额度
@@ -210,7 +207,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture> impl
         Long id = picture.getId();
         String url = picture.getUrl();
         String introduction = picture.getIntroduction();
-        ThrowUtils.throwIf(ObjUtil.isNull(id), ErrorCode.PARAMS_ERROR, "id 涓嶈兘涓虹┖");
+        ThrowUtils.throwIf(ObjUtil.isNull(id), ErrorCode.PARAMS_ERROR, "id 不能为空");
         if (StrUtil.isNotBlank(url)) {
             ThrowUtils.throwIf(url.length() > 1024, ErrorCode.PARAMS_ERROR, "url 过长");
         }
@@ -395,7 +392,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture> impl
             log.error("获取页面失败", e);
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "获取页面失败");
         }
-        // 瑙ｆ瀽鍐呭
+        // 解析内容
         org.jsoup.nodes.Element div = document.getElementsByClass("dgControl").first();
         if (ObjUtil.isEmpty(div)) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "获取元素失败");
@@ -470,17 +467,19 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture> impl
             // 操作数据库
             boolean result = this.removeById(pictureId);
             ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
-            // 更新空间的使用额度，释放额度
-            boolean update = spaceService.lambdaUpdate()
-                    .eq(Space::getId, oldPicture.getSpaceId())
-                    .setSql("totalSize = totalSize - " + oldPicture.getPicSize())
-                    .setSql("totalCount = totalCount - 1")
-                    .update();
-            ThrowUtils.throwIf(!update, ErrorCode.OPERATION_ERROR, "额度更新失败");
+            // 仅当图片属于某个空间时，才回退空间额度（公共图库 spaceId 为 null，无需更新）
+            if (oldPicture.getSpaceId() != null) {
+                boolean update = spaceService.lambdaUpdate()
+                        .eq(Space::getId, oldPicture.getSpaceId())
+                        .setSql("totalSize = totalSize - " + oldPicture.getPicSize())
+                        .setSql("totalCount = totalCount - 1")
+                        .update();
+                ThrowUtils.throwIf(!update, ErrorCode.OPERATION_ERROR, "额度更新失败");
+            }
             return true;
         });
-        // 异步清理文件
-        this.clearPictureFile(oldPicture);
+        // 异步清理文件（通过 AOP 代理调用，确保 @Async 生效；this. 自调用会绕过代理变成同步执行）
+        ((PictureService) AopContext.currentProxy()).clearPictureFile(oldPicture);
     }
 
     @Override
